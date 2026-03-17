@@ -38,6 +38,18 @@ io.on('connection', (socket) => {
       io.to(partyId).emit('video_changed', { videoUrl, hostId: socket.id });
     }
   });
+  // --- WEBRTC EKRAN PAYLAŞIMI SİNYALLEŞMESİ (ÇÖPÇATANLIK) ---
+  socket.on('webrtc_offer', ({ partyId, offer }) => {
+    socket.to(partyId).emit('webrtc_offer', { offer, senderId: socket.id });
+  });
+
+  socket.on('webrtc_answer', ({ partyId, answer }) => {
+    socket.to(partyId).emit('webrtc_answer', { answer, senderId: socket.id });
+  });
+
+  socket.on('webrtc_ice', ({ partyId, candidate }) => {
+    socket.to(partyId).emit('webrtc_ice', { candidate, senderId: socket.id });
+  });
 
   // 3. RAVE SENKRONİZASYONU (BAŞLAT/DURDUR)
   socket.on('play_video', ({ partyId, time }) => {
