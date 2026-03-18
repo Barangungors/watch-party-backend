@@ -1,104 +1,115 @@
+// Render Backend Kodun (index.js veya server.js)
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const cors = require('cors');
 
 const app = express();
+app.use(cors());
+
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
-
-// Odaları ve şifrelerini tutacağımız dev veritabanımız
-const rooms = {};
-
-// Sadece aktif odaları dışarıya (lobiye) veren fonksiyon
-function getActiveRooms() {
-  const active = [];
-  for (const [id, room] of Object.entries(rooms)) {
-    if (room.users.length > 0) {
-      active.push({ id, userCount: room.users.length, hasPassword: !!room.password });
-    }
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
   }
-  return active;
+});
+
+// AĞ VERİTABANI: Odaları ve şifreleri burada tutacağız
+const activeRooms = {}; 
+
+// Sadece güvenli bilgileri (şifresiz hallerini) lobiye göndermek için filtre
+function getPublicRooms() {
+  const publicRooms = [];
+  for (const [roomId, roomData] of Object.entries(activeRooms)) {
+    publicRooms.push({
+      id: roomId,
+      userCount: roomData.users.length,
+      isLocked: !!roomData.password // Şifre varsa true, yoksa false döner
+    });
+  }
+  return publicRooms;
 }
 
 io.on('connection', (socket) => {
-  // Lobiye ilk girenlere odaları göster
-  socket.emit('active_rooms', getActiveRooms());
+  console.log(`Yeni Ajan Bağlandı: ${socket.id}`);
 
-  // 1. ODA KURMA VEYA KATILMA (ŞİFRE KONTROLLÜ)
-  socket.on('join_party', ({ partyId, username, password }) => {
-    if (rooms[partyId]) {
-      // Oda zaten varsa ŞİFREYİ kontrol et
-      if (rooms[partyId].password && rooms[partyId].password !== password) {
-        socket.emit('join_error', "❌ Yanlış şifre! Giremezsin.");
-        return;
-      }
-    } else {
-      // Oda yoksa YENİ ODA KUR
-      rooms[partyId] = {
-        password: password || "",
+  // 1. Yeni bağlanana aktif odaları (Radarı) gönder
+  socket.emit('active_rooms_update', getPublicRooms());
+
+  // 2. Odaya Katılma ve Şifre Kontrolü
+  socket.on('join_party', (data) => {
+    const { partyId, username, password } = data;
+
+    // Oda yoksa YENİ ODA KUR (Kuran kişi Host/Kral olur)
+    if (!activeRooms[partyId]) {
+      activeRooms[partyId] = {
+        password: password || null,
         hostId: socket.id,
-        videoUrl: "https://www.youtube.com/watch?v=DzMrabVqiJE",
         users: []
       };
+    } else {
+      // Oda varsa ŞİFRE KONTROLÜ YAP
+      if (activeRooms[partyId].password && activeRooms[partyId].password !== password) {
+        socket.emit('room_error', 'Erişim Reddedildi: Yanlış Şifre!');
+        return;
+      }
     }
 
-    // Odaya alım işlemleri
+    // Ajanı odaya ekle
     socket.join(partyId);
-    rooms[partyId].users.push({ id: socket.id, name: username });
-    socket.partyId = partyId; // Çıkışta bulabilmek için
+    activeRooms[partyId].users.push({ id: socket.id, name: username });
+    
+    // Odaya başarıyla girildiğini bildir
+    socket.emit('room_joined', partyId);
 
-    socket.emit('join_success', { partyId });
-
-    // Odadakilere güncel listeyi yolla
+    // Odadakileri güncelle
     io.to(partyId).emit('room_state', {
-      videoUrl: rooms[partyId].videoUrl,
-      hostId: rooms[partyId].hostId,
-      users: rooms[partyId].users
+      hostId: activeRooms[partyId].hostId,
+      users: activeRooms[partyId].users
     });
 
-    // LOBİDEKİLERE YENİ ODAYI DUYUR
-    io.emit('active_rooms', getActiveRooms());
+    // Lobideki herkese "Yeni oda açıldı/Kişi katıldı" bilgisini gönder
+    io.emit('active_rooms_update', getPublicRooms());
   });
 
-  // 2. VİDEO VE SOHBET SENKRONİZASYONU
-  socket.on('change_video', ({ partyId, videoUrl }) => {
-    if (rooms[partyId] && rooms[partyId].hostId === socket.id) {
-      rooms[partyId].videoUrl = videoUrl;
-      io.to(partyId).emit('video_changed', { videoUrl, hostId: socket.id });
-    }
+  // 3. Mesajlaşma
+  socket.on('send_message', (data) => {
+    io.to(data.partyId).emit('receive_message', { sender: data.sender, text: data.text });
   });
 
-  socket.on('play_video', ({ partyId, time }) => socket.to(partyId).emit('command_play', time));
-  socket.on('pause_video', ({ partyId }) => socket.to(partyId).emit('command_pause'));
-  socket.on('send_message', (data) => io.to(data.partyId).emit('receive_message', data));
+  // 4. Video Kontrolleri
+  socket.on('play_video', (data) => {
+    socket.to(data.partyId).emit('command_play', data.time);
+  });
+  
+  socket.on('pause_video', (data) => {
+    socket.to(data.partyId).emit('command_pause');
+  });
 
-  // 3. WEBRTC (EKRAN PAYLAŞIMI)
-  socket.on('webrtc_offer', ({ partyId, offer }) => socket.to(partyId).emit('webrtc_offer', { offer, senderId: socket.id }));
-  socket.on('webrtc_answer', ({ partyId, answer }) => socket.to(partyId).emit('webrtc_answer', { answer, senderId: socket.id }));
-  socket.on('webrtc_ice', ({ partyId, candidate }) => socket.to(partyId).emit('webrtc_ice', { candidate, senderId: socket.id }));
-
-  // 4. BAĞLANTI KOPUNCA (Oda boşalırsa sil)
+  // 5. Bağlantı Kopması (Çıkış)
   socket.on('disconnect', () => {
-    const partyId = socket.partyId;
-    if (partyId && rooms[partyId]) {
-      rooms[partyId].users = rooms[partyId].users.filter(u => u.id !== socket.id);
+    for (const roomId in activeRooms) {
+      const room = activeRooms[roomId];
+      const userIndex = room.users.findIndex(u => u.id === socket.id);
       
-      if (rooms[partyId].users.length === 0) {
-        delete rooms[partyId]; // Oda boşaldı, yok et
-      } else {
-        if (rooms[partyId].hostId === socket.id) {
-          rooms[partyId].hostId = rooms[partyId].users[0].id; // Yetkiyi devret
+      if (userIndex !== -1) {
+        room.users.splice(userIndex, 1); // Kullanıcıyı sil
+        
+        if (room.users.length === 0) {
+          delete activeRooms[roomId]; // Oda boşaldıysa odayı sil
+        } else if (room.hostId === socket.id) {
+          room.hostId = room.users[0].id; // Kral çıktıysa, sıradakini Kral yap
         }
-        io.to(partyId).emit('room_state', {
-          videoUrl: rooms[partyId].videoUrl,
-          hostId: rooms[partyId].hostId,
-          users: rooms[partyId].users
-        });
+        
+        // Kalanlara ve lobiye güncel durumu bildir
+        io.to(roomId).emit('room_state', { hostId: room?.hostId, users: room?.users || [] });
+        io.emit('active_rooms_update', getPublicRooms());
+        break;
       }
-      io.emit('active_rooms', getActiveRooms()); // Lobiye güncel halini yolla
     }
   });
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`Sunucu aktif: ${PORT}`));
+server.listen(PORT, () => { console.log(`Siber Sunucu Port ${PORT} Üzerinde Aktif!`); });
